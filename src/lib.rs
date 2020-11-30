@@ -65,7 +65,7 @@ pub fn merge_results(result: &mut CovResult, result2: CovResult) {
     for (&line_no, &execution_count) in &result2.lines {
         match result.lines.entry(line_no) {
             btree_map::Entry::Occupied(c) => {
-                *c.into_mut() += execution_count;
+                *c.into_mut() = c.get().saturating_add(execution_count);
             }
             btree_map::Entry::Vacant(v) => {
                 v.insert(execution_count);
