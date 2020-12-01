@@ -1,0 +1,50 @@
+{% import "macros.html" as macros %}
+<!DOCTYPE html>
+<html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Grcov - top-level </title>
+        <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma@0.9.1/css/bulma.min.css">
+        <script defer src="https://use.fontawesome.com/releases/v5.14.0/js/all.js"></script>
+    </head>
+    <body>
+        <section class="section">
+            <div class="container">
+                <nav class="breadcrumb is-right" aria-label="breadcrumbs">
+                    <ul>
+                        {% for parent in parents %}
+                        <li><a href="{{ parent ~ "/index.html" }}">{{ parent }}</a></li>
+                        {% endfor %}
+                        <li class="is-active"><a href="#" aria-current="page">{{ current }}</a></li>
+                    </ul>
+                </nav>
+                <nav class="level">
+                    <div class="level-left">
+                        {{ macros::summary(stats=stats) }}
+                    </div>
+                </nav>
+                <table class="table is-fullwidth">
+                    <thead>
+                        <tr>
+                            <th>{{ kind }}</th>
+                            <th class="has-text-centered" colspan="3">Line Coverage</th>
+                            <th class="has-text-centered" colspan="2">Functions</th>
+                            <th class="has-text-centered" colspan="2">Branches</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                            {% for item, info in items %}
+                                {{ macros::stats_line(name=item, url=item~"/index.html", stats=info.stats) }}
+                            {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </section>
+        <footer class="footer">
+            <div class="content has-text-centered">
+                <p class="heading">Date: {{ date | date(format="%Y-%m-%d %H:%M") }}</p>
+            </div>
+        </footer>
+    </body>
+</html>

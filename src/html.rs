@@ -1,7 +1,6 @@
 use chrono::{DateTime, Utc};
 use fomat_macros::fomat;
-use std::cmp::Ordering;
-use std::collections::{btree_map, BTreeSet};
+use std::collections::{btree_map, BTreeMap};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -55,26 +54,6 @@ pub fn get_config() -> Config {
     }
 }
 
-impl Ord for HtmlFileStats {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.file_name.cmp(&other.file_name)
-    }
-}
-
-impl PartialOrd for HtmlFileStats {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl PartialEq for HtmlFileStats {
-    fn eq(&self, other: &Self) -> bool {
-        self.file_name == other.file_name
-    }
-}
-
-impl Eq for HtmlFileStats {}
-
 fn get_fn_severity(conf: &Config, rate: f64) -> &str {
     if conf.fn_hi_limit <= rate && rate <= 100. {
         "funHi"
@@ -102,6 +81,39 @@ fn get_branch_severity(conf: &Config, rate: f64) -> &str {
         "branchMed"
     } else {
         "branchLow"
+    }
+}
+
+use serde_json::value::{to_value, from_value, Value};
+use tera::try_get_value;
+
+use std::collections::HashMap;
+
+impl tera::Filter for Config {
+    fn filter(&self, value: &Value, args: &HashMap<String, Value>) -> tera::Result<Value> {
+        let rate = try_get_value!("severity", "value", f64, value);
+
+        let kind = match args.get("kind") {
+            Some(val) => try_get_value!("severity", "kind", String, val),
+            None => "lines".to_string(),
+        };
+
+        fn severity(hi: f64, medium: f64, rate: f64) -> Value {
+            to_value(if hi <= rate && rate <= 100. {
+                "success"
+            } else if medium <= rate && rate < hi {
+                "warning"
+            } else {
+                "danger"
+            }).unwrap()
+        }
+
+        match kind.as_ref() {
+            "lines" => Ok(severity(self.hi_limit, self.med_limit, rate)),
+            "branches" => Ok(severity(self.branch_hi_limit, self.branch_med_limit, rate)),
+            "functions" => Ok(severity(self.fn_hi_limit, self.fn_med_limit, rate)),
+            _ => Err(tera::Error::msg("Unsupported kind")),
+        }
     }
 }
 
@@ -230,6 +242,18 @@ fn get_percentage(x: usize, y: usize) -> f64 {
     }
 }
 
+fn percent(args: &HashMap<String, Value>) -> tera::Result<Value> {
+    if let (Some(n), Some(d)) = (args.get("num"), args.get("den")) {
+        if let (Ok(num), Ok(den)) = (from_value::<usize>(n.clone()), from_value::<usize>(d.clone())) {
+            Ok(to_value(get_percentage(num, den)).unwrap())
+        } else {
+            Err(tera::Error::msg("Invalid arguments"))
+        }
+    } else {
+        Err(tera::Error::msg("Not enough arguments"))
+    }
+}
+
 fn get_base(rel_path: &PathBuf) -> String {
     let count = rel_path.components().count() - 1 /* -1 for the file itself */;
     "../".repeat(count).to_string()
@@ -239,7 +263,6 @@ fn get_dirs_result(global: Arc<Mutex<HtmlGlobalStats>>, rel_path: &PathBuf, stat
     let parent = rel_path.parent().unwrap().to_str().unwrap().to_string();
     let file_name = rel_path.file_name().unwrap().to_str().unwrap().to_string();
     let fs = HtmlFileStats {
-        file_name,
         stats: stats.clone(),
     };
     let mut global = global.lock().unwrap();
@@ -248,11 +271,11 @@ fn get_dirs_result(global: Arc<Mutex<HtmlGlobalStats>>, rel_path: &PathBuf, stat
         btree_map::Entry::Occupied(ds) => {
             let ds = ds.into_mut();
             ds.stats.add(stats);
-            ds.files.insert(fs);
+            ds.files.insert(file_name, fs);
         }
         btree_map::Entry::Vacant(v) => {
-            let mut files = BTreeSet::new();
-            files.insert(fs);
+            let mut files = BTreeMap::new();
+            files.insert(file_name, fs);
             v.insert(HtmlDirStats {
                 files,
                 stats: stats.clone(),
@@ -260,6 +283,8 @@ fn get_dirs_result(global: Arc<Mutex<HtmlGlobalStats>>, rel_path: &PathBuf, stat
         }
     };
 }
+
+use tera::{Tera, Context};
 
 pub fn gen_index(global: HtmlGlobalStats, conf: Config, output: &PathBuf, branch_enabled: bool) {
     let output_file = output.join("index.html");
@@ -272,97 +297,26 @@ pub fn gen_index(global: HtmlGlobalStats, conf: Config, output: &PathBuf, branch
         Ok(f) => f,
     };
 
-    let covered_lines_per = get_percentage(global.stats.covered_lines, global.stats.total_lines);
-    let covered_funs_per = get_percentage(global.stats.covered_funs, global.stats.total_funs);
-    let covered_branches_per =
-        get_percentage(global.stats.covered_branches, global.stats.total_branches);
-    let funs_sev = get_fn_severity(&conf, covered_funs_per);
-    let lines_sev = get_severity(&conf, covered_lines_per);
-    let branches_sev = get_branch_severity(&conf, covered_branches_per);
-    let out = fomat!(
-            r#"<!DOCTYPE html>"# "\n"
-            r#"<html lang="en-us">"# "\n"
-            r#"<head>"# "\n"
-            r#"<title>Grcov report</title>"# "\n"
-            r#"<link rel="stylesheet" href="grcov.css">"# "\n"
-            r#"<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">"# "\n"
-            r#"</head>"# "\n"
-            r#"<body>"# "\n"
-            r#"<div class="header">"# "\n"
-            r#"<div class="view">"# "\n"
-            r#"<div class="viewRow"><span class="viewItem">Current view:</span>"#
-            r#"<span class="viewValue">top level</span></div>"# "\n"
-            r#"<div class="viewRow"><span class="viewItem">Date:</span><span class="viewValue">"# (conf.date.format("%F %T")) r#"</span></div>"# "\n"
-            r#"</div>"# "\n"
-            r#"<div class="stats">"# "\n"
-            r#"<div class="statsRow">"#
-            r#"<span></span><span class="statsHit">Hit</span><span class="statsTotal">Total</span><span class="statsCoverage">Coverage</span></div>"# "\n"
-            r#"<div class="statsRow">"#
-            r#"<span class="statsLine">Lines</span><span class="linesHit">"#
-            (global.stats.covered_lines)
-            r#"</span>"#
-            r#"<span class="linesTotal">"#
-            (global.stats.total_lines)
-            r#"</span>"#
-            r#"<span class="linesPercentage "# (lines_sev) r#"">"#
-            {(covered_lines_per):.1}
-            r#" %</span></div>"# "\n"
-            r#"<div class="statsRow">"#
-            r#"<span class="statsFun">Functions</span><span class="funsHit">"#
-            (global.stats.covered_funs)
-            r#"</span>"#
-            r#"<span class="funsTotal">"#
-            (global.stats.total_funs)
-            r#"</span>"#
-            r#"<span class="funsPercentage "# (funs_sev) r#"">"#
-            {(covered_funs_per):.1}
-            r#" %</span></div>"# "\n"
-            if branch_enabled {
-                r#"<div class="statsRow">"#
-                r#"<span class="statsBranches">Branches</span><span class="branchesHit">"#
-                (global.stats.covered_branches)
-                r#"</span>"#
-                r#"<span class="branchesTotal">"#
-                (global.stats.total_branches)
-                r#"</span>"#
-                r#"<span class="funsPercentage "# (branches_sev) r#"">"#
-                {(covered_branches_per):.1}
-                r#" %</span></div>"# "\n"
-            }
-            r#"</div>"# "\n"
-            r#"</div>"# "\n"
-            r#"<div class="dirStatsHeader"><div class="dirStatsLineHeader">"#
-            r#"<span class="dirNameHeader">Directory</span>"#
-            r#"<span class="dirLineCovHeader">Line Coverage</span>"#
-            r#"<span class="dirFunsHeader">Functions</span>"#
-            if branch_enabled {
-                r#"<span class="dirBranchesHeader">Branches</span>"#
-            }
-            r#"</div></div>"# "\n"
-            r#"<div class="dirStats">"# "\n"
-            for (dir, stats, lines_percent, lines_sev, funs_percent, funs_sev, branches_percent, branches_sev) in global.dirs.iter().map(|(d, s)| {
-                let lp = get_percentage(s.stats.covered_lines, s.stats.total_lines);
-                let fp = get_percentage(s.stats.covered_funs, s.stats.total_funs);
-                let bp = get_percentage(s.stats.covered_branches, s.stats.total_branches);
-                (d, s, lp, get_severity(&conf, lp), fp, get_fn_severity(&conf, fp), bp, get_branch_severity(&conf, bp))
-            }) {
-                r#"<div class="lineDir">"#
-                    r#"<span class="dirName"><a href=""# (dir) r#"/index.html">"# (dir) r#"</a></span>"#
-                    r#"<span class="dirBarPer"><span class="dirBar"><span class="percentBar "# (lines_sev) r#"" style="width:"# (lines_percent) r#"%;"></span></span></span>"#
-                    r#"<span class="dirLinesPer "# (lines_sev) r#"">"# {(lines_percent):.1} r#"%</span>"#
-                    r#"<span class="dirLinesRatio "# (lines_sev) r#"">"# (stats.stats.covered_lines) " / " (stats.stats.total_lines) r#"</span>"#
-                    r#"<span class="dirFunsPer "# (funs_sev) r#"">"# {(funs_percent):.1} r#"%</span>"#
-                    r#"<span class="dirFunsRatio "# (funs_sev) r#"">"# (stats.stats.covered_funs) " / " (stats.stats.total_funs) r#"</span>"#
-                    if branch_enabled {
-                        r#"<span class="dirBranchesPer "# (branches_sev) r#"">"# {(branches_percent):.1} r#"%</span>"#
-                        r#"<span class="dirBranchesRatio "# (branches_sev) r#"">"# (stats.stats.covered_branches) " / " (stats.stats.total_branches) r#"</span>"#
-                    }
-                r#"</div>"# "\n"
-            }
-            r#"</div>"# "\n"
-            r#"</body>"# "\n"
-            r#"</html>"# "\n"
-    );
+    let mut tera = Tera::default();
+
+    tera.register_filter("severity", conf.clone());
+    tera.register_function("percent", &percent);
+
+    tera.add_template_file("macros.html", None).unwrap();
+    tera.add_template_file("index.html", None).unwrap();
+
+    // tera.add_raw_template("index.html", ).unwrap();
+
+    let mut ctx = Context::new();
+    let empty: &[&str] = &[];
+    ctx.insert("date", &conf.date);
+    ctx.insert("current", "top_level");
+    ctx.insert("parents", empty);
+    ctx.insert("stats", &global.stats);
+    ctx.insert("items", &global.dirs);
+    ctx.insert("kind", "Directory");
+
+    let out = tera.render("index.html", &ctx).unwrap();
 
     if output_stream.write_all(out.as_bytes()).is_err() {
         eprintln!("Cannot write the file {:?}", output_file);
@@ -370,16 +324,17 @@ pub fn gen_index(global: HtmlGlobalStats, conf: Config, output: &PathBuf, branch
     }
 
     for (dir_name, dir_stats) in global.dirs.iter() {
-        gen_dir_index(dir_name, dir_stats, &conf, output, branch_enabled);
+        gen_dir_index(&tera, dir_name, dir_stats, &conf, output, branch_enabled);
     }
 }
 
 pub fn gen_dir_index(
+    tera: &Tera,
     dir_name: &str,
     dir_stats: &HtmlDirStats,
     conf: &Config,
     output: &PathBuf,
-    branch_enabled: bool,
+    _branch_enabled: bool,
 ) {
     let index = PathBuf::from(dir_name).join("index.html");
     let output_file = output.join(&index);
@@ -392,105 +347,15 @@ pub fn gen_dir_index(
         Ok(f) => f,
     };
 
-    let base_url = get_base(&index);
-    let mut css_url = base_url.clone();
-    css_url.push_str("grcov.css");
-    let mut index_url = base_url.clone();
-    index_url.push_str("index.html");
-    let covered_lines_per =
-        get_percentage(dir_stats.stats.covered_lines, dir_stats.stats.total_lines);
-    let covered_funs_per = get_percentage(dir_stats.stats.covered_funs, dir_stats.stats.total_funs);
-    let covered_branches_per = get_percentage(
-        dir_stats.stats.covered_branches,
-        dir_stats.stats.total_branches,
-    );
-    let funs_sev = get_fn_severity(&conf, covered_funs_per);
-    let lines_sev = get_severity(&conf, covered_lines_per);
-    let branches_sev = get_branch_severity(&conf, covered_branches_per);
-    let out = fomat!(
-            r#"<!DOCTYPE html>"# "\n"
-            r#"<html lang="en-us">"# "\n"
-            r#"<head>"# "\n"
-            r#"<title>Grcov report &mdash;"# (dir_name) r#"</title>"# "\n"
-            r#"<link rel="stylesheet" href=""# (css_url) r#"">"# "\n"
-            r#"<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">"# "\n"
-            r#"</head>"# "\n"
-            r#"<body>"# "\n"
-            r#"<div class="header">"# "\n"
-            r#"<div class="view">"# "\n"
-            r#"<div class="viewRow"><span class="viewItem">Current view:</span>"#
-            r#"<span class="viewValue"><a href=""# (index_url) r#"">top level</a> - "# (dir_name) r#"</span></div>"# "\n"
-            r#"<div class="viewRow"><span class="viewItem">Date:</span><span class="viewValue">"# (conf.date.format("%F %T")) r#"</span></div>"# "\n"
-            r#"</div>"# "\n"
-            r#"<div class="stats">"# "\n"
-            r#"<div class="statsRow">"#
-            r#"<span></span><span class="statsHit">Hit</span><span class="statsTotal">Total</span><span class="statsCoverage">Coverage</span></div>"# "\n"
-            r#"<div class="statsRow">"#
-            r#"<span class="statsLine">Lines</span><span class="linesHit">"#
-            (dir_stats.stats.covered_lines)
-            r#"</span>"#
-            r#"<span class="linesTotal">"#
-            (dir_stats.stats.total_lines)
-            r#"</span>"#
-            r#"<span class="linesPercentage "# (lines_sev) r#"">"#
-            {(covered_lines_per):.1}
-            r#" %</span></div>"# "\n"
-            r#"<div class="statsRow">"#
-            r#"<span class="statsFun">Functions</span><span class="funsHit">"#
-            (dir_stats.stats.covered_funs)
-            r#"</span>"#
-            r#"<span class="funsTotal">"#
-            (dir_stats.stats.total_funs)
-            r#"</span>"#
-            r#"<span class="funsPercentage "# (funs_sev) r#"">"#
-            {(covered_funs_per):.1}
-            r#" %</span></div>"# "\n"
-            if branch_enabled {
-                r#"<div class="statsRow">"#
-                r#"<span class="statsBranches">Branches</span><span class="branchesHit">"#
-                (dir_stats.stats.covered_branches)
-                r#"</span>"#
-                r#"<span class="branchesTotal">"#
-                (dir_stats.stats.total_branches)
-                r#"</span>"#
-                r#"<span class="branchesPercentage "# (branches_sev) r#"">"#
-                {(covered_branches_per):.1}
-                r#" %</span></div>"# "\n"
-            }
-            r#"</div>"# "\n"
-            r#"</div>"# "\n"
-            r#"<div class="dirStatsHeader"><div class="dirStatsLineHeader">"#
-            r#"<span class="dirNameHeader">Filename</span>"#
-            r#"<span class="dirLineCovHeader">Line Coverage</span>"#
-            r#"<span class="dirFunsHeader">Functions</span>"#
-            if branch_enabled {
-                r#"<span class="dirBranchesHeader">Branches</span>"#
-            }
-            r#"</div></div>"# "\n"
-            r#"<div class="dirStats">"# "\n"
-            for (file_name, stats, lines_percent, lines_sev, funs_percent, funs_sev, branches_percent, branches_sev) in dir_stats.files.iter().map(|fs| {
-                let lp = get_percentage(fs.stats.covered_lines, fs.stats.total_lines);
-                let fp = get_percentage(fs.stats.covered_funs, fs.stats.total_funs);
-                let bp = get_percentage(fs.stats.covered_branches, fs.stats.total_branches);
-                (&fs.file_name, &fs.stats, lp, get_severity(conf, lp), fp, get_fn_severity(conf, fp), bp, get_branch_severity(conf, bp))
-            }) {
-                r#"<div class="lineDir">"#
-                    r#"<span class="dirName"><a href=""# (file_name) r#".html">"# (file_name) r#"</a></span>"#
-                    r#"<span class="dirBarPer"><span class="dirBar"><span class="percentBar "# (lines_sev) r#"" style="width:"# (lines_percent) r#"%;"></span></span></span>"#
-                    r#"<span class="dirLinesPer "# (lines_sev) r#"">"# {(lines_percent):.1} r#"%</span>"#
-                    r#"<span class="dirLinesRatio "# (lines_sev) r#"">"# (stats.covered_lines) " / " (stats.total_lines) r#"</span>"#
-                    r#"<span class="dirFunsPer "# (funs_sev) r#"">"# {(funs_percent):.1} r#"%</span>"#
-                    r#"<span class="dirFunsRatio "# (funs_sev) r#"">"# (stats.covered_funs) " / " (stats.total_funs) r#"</span>"#
-                    if branch_enabled {
-                        r#"<span class="dirBranchesPer "# (branches_sev) r#"">"# {(branches_percent):.1} r#"%</span>"#
-                        r#"<span class="dirBranchesRatio "# (branches_sev) r#"">"# (stats.covered_branches) " / " (stats.total_branches) r#"</span>"#
-                    }
-                r#"</div>"# "\n"
-            }
-            r#"</div>"# "\n"
-            r#"</body>"# "\n"
-            r#"</html>"# "\n"
-    );
+    let mut ctx = Context::new();
+    ctx.insert("date", &conf.date);
+    ctx.insert("current", dir_name);
+    ctx.insert("parents", &["top_level"]);
+    ctx.insert("stats", &dir_stats.stats);
+    ctx.insert("items", &dir_stats.files);
+    ctx.insert("kind", "File");
+
+    let out = tera.render("index.html", &ctx).unwrap();
 
     if output.write_all(out.as_bytes()).is_err() {
         eprintln!("Cannot write the file {:?}", output_file);
